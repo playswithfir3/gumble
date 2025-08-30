@@ -147,11 +147,21 @@ func DialWithDialer(dialer *net.Dialer, addr string, config *Config, tlsConfig *
 		if vo.VersionUint32 != nil {
 			verU32 = *vo.VersionUint32
 		} else if vo.Semver != "" {
-			if packed, err := packSemver(vo.Semver); err == nil {
-				verU32 = packed
-			}
+		    if packed, err := packSemver(vo.Semver); err == nil {
+		        verU32 = packed
+		    } else {
+		        // NEW: accept builds like 1.5.735 -> pack 1.5.0 and show build in Release
+		        var maj, min, build uint32
+		        if _, err2 := fmt.Sscanf(vo.Semver, "%d.%d.%d", &maj, &min, &build); err2 == nil {
+		            verU32 = (maj<<16 | min<<8 | 0)
+		            if release == "" {
+		                release = fmt.Sprintf("%d.%d.%d", maj, min, build)
+		            }
+		        }
+		    }
 		}
 	}
+
 
 	versionPacket := MumbleProto.Version{
 		Version:   proto.Uint32(verU32),
