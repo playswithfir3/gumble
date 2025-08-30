@@ -14,16 +14,6 @@ import (
 	"layeh.com/gumble/gumble/MumbleProto"
 )
 
-// VersionOverride controls the initial Version message sent during the TLS handshake.
-// Add `VersionOverride *VersionOverride` to your Config type.
-type VersionOverride struct {
-	Release       string   // e.g. "my-bot/2.3"
-	OS            string   // e.g. "linux" or "windows"
-	OSVersion     string   // e.g. "amd64"
-	Semver        string   // "MAJOR.MINOR.PATCH" -> packed (maj<<16 | min<<8 | pat)
-	VersionUint32 *uint32  // direct override if you already have the packed value
-}
-
 // packSemver turns "MAJOR.MINOR.PATCH" into the uint32 used in Mumble's Version.
 func packSemver(s string) (uint32, error) {
 	var maj, min, pat uint32
