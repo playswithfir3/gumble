@@ -1,6 +1,7 @@
 package gumble
 
 import (
+	"fmt"
 	"crypto/tls"
 	"errors"
 	"math"
@@ -12,6 +13,26 @@ import (
 	"github.com/golang/protobuf/proto"
 	"layeh.com/gumble/gumble/MumbleProto"
 )
+
+// VersionOverride controls the initial Version message sent during the TLS handshake.
+// Add `VersionOverride *VersionOverride` to your Config type.
+type VersionOverride struct {
+	Release       string   // e.g. "my-bot/2.3"
+	OS            string   // e.g. "linux" or "windows"
+	OSVersion     string   // e.g. "amd64"
+	Semver        string   // "MAJOR.MINOR.PATCH" -> packed (maj<<16 | min<<8 | pat)
+	VersionUint32 *uint32  // direct override if you already have the packed value
+}
+
+// packSemver turns "MAJOR.MINOR.PATCH" into the uint32 used in Mumble's Version.
+func packSemver(s string) (uint32, error) {
+	var maj, min, pat uint32
+	n, err := fmt.Sscanf(s, "%d.%d.%d", &maj, &min, &pat)
+	if err != nil || n != 3 || maj > 0xFFFF || min > 0xFF || pat > 0xFF {
+		return 0, fmt.Errorf("invalid semver %q", s)
+	}
+	return (maj<<16 | min<<8 | pat), nil
+}
 
 // State is the current state of the client's connection to the server.
 type State int
@@ -115,19 +136,47 @@ func DialWithDialer(dialer *net.Dialer, addr string, config *Config, tlsConfig *
 
 	go client.readRoutine()
 
-	// Initial packets
-	versionPacket := MumbleProto.Version{
-		Version:   proto.Uint32(ClientVersion),
-		Release:   proto.String("gumble"),
-		Os:        proto.String(runtime.GOOS),
-		OsVersion: proto.String(runtime.GOARCH),
+	// -------- Build the initial Version packet (with optional overrides) --------
+	// Defaults reproduce original gumble behavior.
+	release := "gumble"
+	osStr := runtime.GOOS
+	osVer := runtime.GOARCH
+	verU32 := uint32(ClientVersion)
+
+	if client.Config != nil && client.Config.VersionOverride != nil {
+		vo := client.Config.VersionOverride
+		if vo.Release != "" {
+			release = vo.Release
+		}
+		if vo.OS != "" {
+			osStr = vo.OS
+		}
+		if vo.OSVersion != "" {
+			osVer = vo.OSVersion
+		}
+		if vo.VersionUint32 != nil {
+			verU32 = *vo.VersionUint32
+		} else if vo.Semver != "" {
+			if packed, err := packSemver(vo.Semver); err == nil {
+				verU32 = packed
+			}
+		}
 	}
+
+	versionPacket := MumbleProto.Version{
+		Version:   proto.Uint32(verU32),
+		Release:   proto.String(release),
+		Os:        proto.String(osStr),
+		OsVersion: proto.String(osVer),
+	}
+
 	authenticationPacket := MumbleProto.Authenticate{
 		Username: &client.Config.Username,
 		Password: &client.Config.Password,
 		Opus:     proto.Bool(getAudioCodec(audioCodecIDOpus) != nil),
 		Tokens:   client.Config.Tokens,
 	}
+
 	client.Conn.WriteProto(&versionPacket)
 	client.Conn.WriteProto(&authenticationPacket)
 
@@ -161,129 +210,10 @@ func DialWithDialer(dialer *net.Dialer, addr string, config *Config, tlsConfig *
 			client.Conn.Close()
 			return nil, err
 		}
-
 		return client, nil
 	}
 }
 
 // State returns the current state of the client.
 func (c *Client) State() State {
-	return State(atomic.LoadUint32(&c.state))
-}
-
-// AudioOutgoing creates a new channel that outgoing audio data can be written
-// to. The channel must be closed after the audio stream is completed. Only
-// a single channel should be open at any given time (i.e. close the channel
-// before opening another).
-func (c *Client) AudioOutgoing() chan<- AudioBuffer {
-	ch := make(chan AudioBuffer)
-	go func() {
-		var seq int64
-		previous := <-ch
-		for p := range ch {
-			previous.writeAudio(c, seq, false)
-			previous = p
-			seq = (seq + 1) % math.MaxInt32
-		}
-		if previous != nil {
-			previous.writeAudio(c, seq, true)
-		}
-	}()
-	return ch
-}
-
-// pingRoutine sends ping packets to the server at regular intervals.
-func (c *Client) pingRoutine() {
-	ticker := time.NewTicker(time.Second * 5)
-	defer ticker.Stop()
-
-	var timestamp uint64
-	var tcpPingAvg float32
-	var tcpPingVar float32
-	packet := MumbleProto.Ping{
-		Timestamp:  &timestamp,
-		TcpPackets: &c.tcpPacketsReceived,
-		TcpPingAvg: &tcpPingAvg,
-		TcpPingVar: &tcpPingVar,
-	}
-
-	t := time.Now()
-	for {
-		timestamp = uint64(t.UnixNano())
-		tcpPingAvg = math.Float32frombits(atomic.LoadUint32(&c.tcpPingAvg))
-		tcpPingVar = math.Float32frombits(atomic.LoadUint32(&c.tcpPingVar))
-		c.Conn.WriteProto(&packet)
-
-		select {
-		case <-c.end:
-			return
-		case t = <-ticker.C:
-			// continue to top of loop
-		}
-	}
-}
-
-// readRoutine reads protocol buffer messages from the server.
-func (c *Client) readRoutine() {
-	c.disconnectEvent = DisconnectEvent{
-		Client: c,
-		Type:   DisconnectError,
-	}
-
-	for {
-		pType, data, err := c.Conn.ReadPacket()
-		if err != nil {
-			break
-		}
-		if int(pType) < len(handlers) {
-			handlers[pType](c, data)
-		}
-	}
-
-	wasSynced := c.State() == StateSynced
-	atomic.StoreUint32(&c.state, uint32(StateDisconnected))
-	close(c.end)
-	if wasSynced {
-		c.Config.Listeners.onDisconnect(&c.disconnectEvent)
-	}
-}
-
-// RequestUserList requests that the server's registered user list be sent to
-// the client.
-func (c *Client) RequestUserList() {
-	packet := MumbleProto.UserList{}
-	c.Conn.WriteProto(&packet)
-}
-
-// RequestBanList requests that the server's ban list be sent to the client.
-func (c *Client) RequestBanList() {
-	packet := MumbleProto.BanList{
-		Query: proto.Bool(true),
-	}
-	c.Conn.WriteProto(&packet)
-}
-
-// Disconnect disconnects the client from the server.
-func (c *Client) Disconnect() error {
-	if c.State() == StateDisconnected {
-		return errors.New("gumble: client is already disconnected")
-	}
-	c.disconnectEvent.Type = DisconnectUser
-	c.Conn.Close()
-	return nil
-}
-
-// Do executes f in a thread-safe manner. It ensures that Client and its
-// associated data will not be changed during the lifetime of the function
-// call.
-func (c *Client) Do(f func()) {
-	c.volatile.RLock()
-	defer c.volatile.RUnlock()
-
-	f()
-}
-
-// Send will send a Message to the server.
-func (c *Client) Send(message Message) {
-	message.writeMessage(c)
-}
+	return State(atomic.LoadUint32(&c.state)
