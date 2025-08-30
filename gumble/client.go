@@ -216,4 +216,122 @@ func DialWithDialer(dialer *net.Dialer, addr string, config *Config, tlsConfig *
 
 // State returns the current state of the client.
 func (c *Client) State() State {
-	return State(atomic.LoadUint32(&c.state)
+	return State(atomic.LoadUint32(&c.state))
+}
+
+// AudioOutgoing creates a new channel that outgoing audio data can be written
+// to. The channel must be closed after the audio stream is completed. Only
+// a single channel should be open at any given time (i.e. close the channel
+// before opening another).
+func (c *Client) AudioOutgoing() chan<- AudioBuffer {
+	ch := make(chan AudioBuffer)
+	go func() {
+		var seq int64
+		previous := <-ch
+		for p := range ch {
+			previous.writeAudio(c, seq, false)
+			previous = p
+			seq = (seq + 1) % math.MaxInt32
+		}
+		if previous != nil {
+			previous.writeAudio(c, seq, true)
+		}
+	}()
+	return ch
+}
+
+// pingRoutine sends ping packets to the server at regular intervals.
+func (c *Client) pingRoutine() {
+	ticker := time.NewTicker(time.Second * 5)
+	defer ticker.Stop()
+
+	var timestamp uint64
+	var tcpPingAvg float32
+	var tcpPingVar float32
+	packet := MumbleProto.Ping{
+		Timestamp:  &timestamp,
+		TcpPackets: &c.tcpPacketsReceived,
+		TcpPingAvg: &tcpPingAvg,
+		TcpPingVar: &tcpPingVar,
+	}
+
+	t := time.Now()
+	for {
+		timestamp = uint64(t.UnixNano())
+		tcpPingAvg = math.Float32frombits(atomic.LoadUint32(&c.tcpPingAvg))
+		tcpPingVar = math.Float32frombits(atomic.LoadUint32(&c.tcpPingVar))
+		c.Conn.WriteProto(&packet)
+
+		select {
+		case <-c.end:
+			return
+		case t = <-ticker.C:
+			// continue to top of loop
+		}
+	}
+}
+
+// readRoutine reads protocol buffer messages from the server.
+func (c *Client) readRoutine() {
+	c.disconnectEvent = DisconnectEvent{
+		Client: c,
+		Type:   DisconnectError,
+	}
+
+	for {
+		pType, data, err := c.Conn.ReadPacket()
+		if err != nil {
+			break
+		}
+		if int(pType) < len(handlers) {
+			handlers[pType](c, data)
+		}
+	}
+
+	wasSynced := c.State() == StateSynced
+	atomic.StoreUint32(&c.state, uint32(StateDisconnected))
+	close(c.end)
+	if wasSynced {
+		c.Config.Listeners.onDisconnect(&c.disconnectEvent)
+	}
+}
+
+// RequestUserList requests that the server's registered user list be sent to
+// the client.
+func (c *Client) RequestUserList() {
+	packet := MumbleProto.UserList{}
+	c.Conn.WriteProto(&packet)
+}
+
+// RequestBanList requests that the server's ban list be sent to the client.
+func (c *Client) RequestBanList() {
+	packet := MumbleProto.BanList{
+		Query: proto.Bool(true),
+	}
+	c.Conn.WriteProto(&packet)
+}
+
+// Disconnect disconnects the client from the server.
+func (c *Client) Disconnect() error {
+	if c.State() == StateDisconnected {
+		return errors.New("gumble: client is already disconnected")
+	}
+	c.disconnectEvent.Type = DisconnectUser
+	c.Conn.Close()
+	return nil
+}
+
+// Do executes f in a thread-safe manner. It ensures that Client and its
+// associated data will not be changed during the lifetime of the function
+// call.
+func (c *Client) Do(f func()) {
+	c.volatile.RLock()
+	defer c.volatile.RUnlock()
+
+	f()
+}
+
+// Send will send a Message to the server.
+func (c *Client) Send(message Message) {
+	message.writeMessage(c)
+}
